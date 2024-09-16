@@ -1,0 +1,128 @@
+import sys
+import re
+import logging
+from awsglue.transforms import SelectFields
+from awsglue.utils import getResolvedOptions
+from pyspark.context import SparkContext
+from awsglue.context import GlueContext
+from awsglue.job import Job
+from awsglue.dynamicframe import DynamicFrame
+from pyspark.sql.functions import lit, current_timestamp, date_format
+
+# Initialize logger
+logger = logging.getLogger()
+logger.setLevel(logging.INFO)
+
+# Initialize Glue context
+args = getResolvedOptions(sys.argv, ['JOB_NAME', 'S3_INPUT_PATH', 'S3_OUTPUT_PATH'])
+sc = SparkContext()
+glueContext = GlueContext(sc)
+spark = glueContext.spark_session
+job = Job(glueContext)
+job.init(args['JOB_NAME'], args)
+
+# Read the input and output paths from arguments
+input_path = args['S3_INPUT_PATH']
+output_path = args['S3_OUTPUT_PATH']
+
+# Extract the customer name, year, month, and day from the file path
+file_name = input_path.split("/")[-1]
+match = re.match(r"([a-zA-Z]+)-(\d{4})-(\d{2})-(\d{2})\.csv", file_name)
+
+if match:
+    customer_name = match.group(1)
+    year = match.group(2)
+    month = match.group(3)
+    day = match.group(4)
+    logger.info(f"Extracted customer name: {customer_name}, year: {year}, month: {month}, day: {day}")
+else:
+    logger.error(f"File name '{file_name}' does not match the expected pattern 'customer-yyyy-mm-dd.csv'.")
+    sys.exit(1)  # Exit the script with an error status
+
+# Load the CSV data into a dynamic frame
+dynamic_frame = glueContext.create_dynamic_frame.from_options(
+    format_options={"withHeader": True},
+    connection_type="s3",
+    format="csv",
+    connection_options={"paths": [input_path]},
+    transformation_ctx="dynamic_frame"
+)
+
+# Convert dynamic frame to DataFrame
+df = dynamic_frame.toDF()
+
+# Add the new columns 'customer_name' and 'collected_date'
+df = df.withColumn("customer_name", lit(customer_name)) \
+       .withColumn("collected_date", date_format(current_timestamp(), "yyyy-MM-dd'T'HH:mm:ss'Z'"))
+
+# Debugging: Log DataFrame row count after adding columns
+logger.info(f"Row count after adding customer_name and collected_date: {df.count()}")
+
+# Rename relevant columns (be sure not to affect 'customer_name' and 'collected_date')
+df = df.withColumnRenamed("DbInstanceId.options.label", "DbInstanceId_options_label") \
+       .withColumnRenamed("details.instanceCreateTime", "details_instanceCreateTime") \
+       .withColumnRenamed("details.dBInstanceArn", "details_dBInstanceArn") \
+       .withColumnRenamed("details.dBClusterIdentifier", "details_dBClusterIdentifier")
+
+# Debugging: Log DataFrame row count after renaming columns
+logger.info(f"Row count after renaming columns: {df.count()}")
+
+# Optionally, repartition data to avoid small Parquet partitions
+df = df.repartition(1)  # Set the number of partitions as needed
+
+# Convert back to DynamicFrame
+dynamic_frame_with_customer = DynamicFrame.fromDF(df, glueContext, "dynamic_frame_with_customer")
+
+# Debugging: Verify DynamicFrame schema and row count
+logger.info(f"DynamicFrame Schema after conversion: {dynamic_frame_with_customer.schema()}")
+logger.info(f"Row count after conversion to DynamicFrame: {dynamic_frame_with_customer.toDF().count()}")
+
+# Define columns to keep, excluding 'year', 'month', and 'day'
+columns_to_keep = [
+    "Engine",
+    "InstanceType",
+    "region",
+    "AzType",
+    "PrimaryAZ",
+    "SecondaryAZ",
+    "accountId",
+    "details_dBInstanceArn",
+    "details_dBClusterIdentifier",
+    "details_instanceCreateTime",
+    "DbInstanceId_options_label",
+    "collected_date"  # Ensure this column is included
+]
+
+# Apply SelectFields transformation
+dynamic_frame_selected = SelectFields.apply(
+    frame=dynamic_frame_with_customer, 
+    paths=columns_to_keep, 
+    transformation_ctx="dynamic_frame_selected"
+)
+
+# Debugging: Log DynamicFrame row count after SelectFields
+logger.info(f"Row count after SelectFields: {dynamic_frame_selected.toDF().count()}")
+
+# Manually create output path for each customer and write the output
+customer_output_path = f"{output_path}/customer_name={customer_name}/year={year}/month={month}/day={day}"
+
+# Write the output back to S3 in Parquet format (ensure no partitionKeys for now)
+try:
+    glueContext.write_dynamic_frame.from_options(
+        frame=dynamic_frame_selected,
+        connection_type="s3",
+        format="parquet",
+        connection_options={"path": customer_output_path},
+        format_options={"compression": "SNAPPY"},
+        transformation_ctx="write_dynamic_frame_selected"
+    )
+    logger.info(f"Data written successfully to S3 at {customer_output_path}.")
+except Exception as e:
+    logger.error(f"Failed to write data to S3: {e}")
+    sys.exit(1)
+
+# Final row count check
+final_row_count = dynamic_frame_selected.toDF().count()
+logger.info(f"Final row count before writing Parquet: {final_row_count}")
+
+job.commit()
